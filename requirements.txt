@@ -1,0 +1,32 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# requirements.txt
+# Alzheimer's MRI Classification Project
+# Tested on macOS (Apple Silicon M1/M2/M3/M4) with Python 3.11+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── PyTorch (MPS-enabled for Apple Silicon) ──────────────────────────────────
+# Install PyTorch FIRST using the command below (not via pip requirements).
+# See README.md §Setup for the exact command.
+# Do NOT install torch via this file — the pip index does not correctly handle
+# the macOS MPS wheel selection.
+
+# ── Deep learning ─────────────────────────────────────────────────────────────
+timm>=0.9.16             # PyTorch Image Models — EfficientNetB0 + pretrained weights
+torchvision>=0.18.0      # transforms, datasets (installed alongside torch)
+
+# ── Data & ML ─────────────────────────────────────────────────────────────────
+numpy>=1.26.0
+Pillow>=10.3.0           # image loading
+scikit-learn>=1.4.0      # train_test_split, metrics
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+tqdm>=4.66.0             # progress bars
+pandas>=2.2.0            # metrics DataFrames, CSV logging
+
+# ── Optional — nice to have ───────────────────────────────────────────────────
+# tensorboard>=2.16.0    # uncomment if you want TensorBoard logging
+# ipykernel              # uncomment if you want to run notebooks
