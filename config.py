@@ -22,7 +22,7 @@ CLASS_NAMES = [
 NUM_CLASSES = len(CLASS_NAMES)
 
 # ─── Dataset Balancing ────────────────────────────────────────────────────────
-TRAIN_SAMPLES_PER_CLASS = 7_000   # oversample/undersample to this number
+TRAIN_SAMPLES_PER_CLASS = 2000   # oversample/undersample to this number
 TEST_SAMPLES_PER_CLASS = 800     # undersample majority test classes to this
 
 # ─── Image ────────────────────────────────────────────────────────────────────
@@ -34,18 +34,18 @@ VAL_SPLIT = 0.20                 # 20 % of the remaining train set → validatio
 
 # ─── Training ─────────────────────────────────────────────────────────────────
 BATCH_SIZE = 32
-EPOCHS = 50
-LEARNING_RATE = 1e-4
+EPOCHS = 30
+LEARNING_RATE = 3e-5
 RANDOM_SEED = 42
 
 # ─── Model ────────────────────────────────────────────────────────────────────
 DROPOUT_1 = 0.3
 DROPOUT_2 = 0.5
-DENSE_UNITS = 512
-L2_REG = 0.001
+DENSE_UNITS = 256
+L2_REG = 1e-4
 
 # ─── Early Stopping / LR Scheduler ───────────────────────────────────────────
-ES_PATIENCE = 5
+ES_PATIENCE = 8
 ES_MIN_DELTA = 1e-4
 LR_FACTOR = 0.5
 LR_PATIENCE = 3

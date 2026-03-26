@@ -1,41 +1,37 @@
 """
 src/data_loader.py
-Dataset loading, per-class balancing, train/val/test splitting,
-and PyTorch DataLoader creation.
+Dataset loading, patient-aware train/val/test splitting,
+training-only balancing, and PyTorch DataLoader creation.
 
-Key design decisions vs. the original notebook:
-- Paths handled with pathlib — no hardcoded strings.
-- Patient-aware splitting: images from the same patient stay in the same split,
-  preventing data leakage between train and test sets.
-- Balancing is done with reproducible random.choices / random.sample using the
-  configured seed.
-- Returns standard PyTorch DataLoaders (works with MPS, CUDA, CPU).
-- Augmentation is applied only to the training set.
+Key design decisions:
+- All splits are patient-disjoint.
+- Train/val/test are created before any balancing.
+- Only the training split is balanced.
+- Validation and test transforms are deterministic.
+- Split diagnostics assert that there is no leakage by patient, scan, or path.
 """
 
 from __future__ import annotations
+
+import random
+import re
+import sys
+from pathlib import Path
+
+import torch
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+
 from config import (
     CLASS_NAMES,
     IMAGE_SIZE,
     RANDOM_SEED,
-    TEST_SAMPLES_PER_CLASS,
     TEST_SPLIT,
     TRAIN_SAMPLES_PER_CLASS,
     VAL_SPLIT,
 )
 
-import random
-import re
-from pathlib import Path
-
-import numpy as np
-import torch
-from PIL import Image
-from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
-
-import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
@@ -49,11 +45,29 @@ def _parse_filename(filename: str) -> tuple[int | None, int | None, int | None, 
     Extract (patient_id, mr_id, scan_id, layer_id) from an OASIS filename.
     Returns (None, None, None, None) if the filename doesn't match the pattern.
     """
-    match = _FILENAME_PATTERN.match(filename)
+    match = _FILENAME_PATTERN.fullmatch(filename)
     if match:
-        # type: ignore[return-value]
         return tuple(int(g) for g in match.groups())
     return None, None, None, None
+
+
+def _require_parsed_filename(path: Path) -> tuple[int, int, int, int]:
+    patient_id, mr_id, scan_id, layer_id = _parse_filename(path.name)
+    if patient_id is None:
+        raise ValueError(
+            f"Unable to extract patient ID from filename: {path.name}\n"
+            "Expected pattern: OAS1_<patient>_MR<mr>_mpr-<scan>_<layer>.jpg"
+        )
+    return patient_id, mr_id, scan_id, layer_id
+
+
+def _patient_id(path: Path) -> int:
+    return _require_parsed_filename(path)[0]
+
+
+def _scan_key(path: Path) -> tuple[int, int, int]:
+    patient_id, mr_id, scan_id, _ = _require_parsed_filename(path)
+    return patient_id, mr_id, scan_id
 
 
 # ─── Path collection ──────────────────────────────────────────────────────────
@@ -68,9 +82,6 @@ def collect_paths(data_dir: Path) -> dict[str, list[Path]]:
             Very mild Dementia/
             Mild Dementia/
             Moderate Dementia/
-
-    Returns:
-        { class_name: [Path, ...], ... }
     """
     paths: dict[str, list[Path]] = {}
     for class_name in CLASS_NAMES:
@@ -88,49 +99,54 @@ def collect_paths(data_dir: Path) -> dict[str, list[Path]]:
 
 # ─── Patient-aware splitting ──────────────────────────────────────────────────
 
-def _split_by_patient(
-    image_paths: list[Path],
-    test_size: float,
-    seed: int,
-) -> tuple[list[Path], list[Path]]:
-    """
-    Split image paths into train/test ensuring no patient appears in both splits.
-
-    Why patient-aware?
-    ------------------
-    The same patient has multiple MRI slices.  If we split naively by image,
-    slices from the same patient can end up in both train and test, making the
-    model look better than it is (data leakage).  We split by *patient ID*
-    first, then collect all slices for each patient.
-    """
-    # Group paths by patient_id
+def _group_paths_by_patient(image_paths: list[Path]) -> dict[int, list[Path]]:
+    """Group image paths by patient ID. Raises on unparseable filenames."""
     patient_to_paths: dict[int, list[Path]] = {}
-    ungrouped: list[Path] = []
+    for path in image_paths:
+        patient_to_paths.setdefault(_patient_id(path), []).append(path)
 
-    for p in image_paths:
-        patient_id, *_ = _parse_filename(p.name)
-        if patient_id is None:
-            ungrouped.append(p)
-            continue
-        patient_to_paths.setdefault(patient_id, []).append(p)
+    for grouped_paths in patient_to_paths.values():
+        grouped_paths.sort()
+    return patient_to_paths
 
-    patient_ids = list(patient_to_paths.keys())
 
-    if len(patient_ids) < 2:
-        # Fallback: too few patients identified — split by image
-        return train_test_split(image_paths, test_size=test_size, random_state=seed)
+def _split_sequence(
+    items: list[int],
+    holdout_fraction: float,
+    seed: int,
+    ensure_non_empty_holdout: bool = False,
+) -> tuple[list[int], list[int]]:
+    """
+    Deterministically split a sequence into (keep, holdout).
 
-    train_ids, test_ids = train_test_split(
-        patient_ids, test_size=test_size, random_state=seed
-    )
+    If the class is very small, the holdout can be empty instead of falling
+    back to image-level splitting, which would leak patients across splits.
+    """
+    items = list(items)
+    if not items:
+        return [], []
+    if len(items) == 1:
+        return items, []
 
-    train_paths = [p for pid in train_ids for p in patient_to_paths[pid]]
-    test_paths = [p for pid in test_ids for p in patient_to_paths[pid]]
+    rng = random.Random(seed)
+    shuffled = items.copy()
+    rng.shuffle(shuffled)
 
-    # Put ungrouped images in train (safe default)
-    train_paths.extend(ungrouped)
+    holdout_count = int(round(len(shuffled) * holdout_fraction))
+    if ensure_non_empty_holdout and holdout_count == 0:
+        holdout_count = 1
+    holdout_count = max(0, min(len(shuffled) - 1, holdout_count))
 
-    return train_paths, test_paths
+    holdout_items = shuffled[:holdout_count]
+    keep_items = shuffled[holdout_count:]
+    return keep_items, holdout_items
+
+
+def _flatten_grouped_paths(
+    patient_to_paths: dict[int, list[Path]],
+    patient_ids: list[int],
+) -> list[Path]:
+    return [path for patient_id in patient_ids for path in patient_to_paths[patient_id]]
 
 
 # ─── Balancing ────────────────────────────────────────────────────────────────
@@ -141,16 +157,92 @@ def _balance_paths(
     seed: int,
 ) -> list[Path]:
     """
-    Under- or over-sample a list of paths to exactly `target` items.
+    Under- or over-sample a list of training paths to exactly `target` items.
 
     - Oversample (target > len): random.choices (with replacement)
     - Undersample (target < len): random.sample (without replacement)
     """
+    if target <= 0:
+        return []
+    if not paths:
+        raise ValueError("Cannot balance an empty training split.")
+
     rng = random.Random(seed)
     if len(paths) >= target:
         return rng.sample(paths, target)
-    else:
-        return rng.choices(paths, k=target)
+    return rng.choices(paths, k=target)
+
+
+# ─── Split diagnostics ────────────────────────────────────────────────────────
+
+def _class_counts(labels: list[int]) -> dict[str, int]:
+    counts = {class_name: 0 for class_name in CLASS_NAMES}
+    for label in labels:
+        counts[CLASS_NAMES[label]] += 1
+    return counts
+
+
+def _print_class_counts(name: str, labels: list[int]) -> None:
+    counts = _class_counts(labels)
+    print(f"[data_loader] {name} per-class counts:")
+    for class_name in CLASS_NAMES:
+        print(f"  {class_name:<22}: {counts[class_name]:>6}")
+
+
+def _assert_no_overlap(
+    name_a: str,
+    paths_a: list[Path],
+    name_b: str,
+    paths_b: list[Path],
+) -> None:
+    path_overlap = set(paths_a) & set(paths_b)
+    patient_overlap = {_patient_id(path) for path in paths_a} & {
+        _patient_id(path) for path in paths_b}
+    scan_overlap = {_scan_key(path) for path in paths_a} & {
+        _scan_key(path) for path in paths_b}
+
+    print(
+        f"[data_loader] Overlap {name_a}/{name_b}: "
+        f"patients={len(patient_overlap)}, scans={len(scan_overlap)}, paths={len(path_overlap)}"
+    )
+
+    assert not patient_overlap, (
+        f"Patient leakage detected between {name_a} and {name_b}: "
+        f"{sorted(patient_overlap)[:10]}"
+    )
+    assert not scan_overlap, (
+        f"Scan leakage detected between {name_a} and {name_b}: "
+        f"{sorted(scan_overlap)[:10]}"
+    )
+    assert not path_overlap, (
+        f"File-path leakage detected between {name_a} and {name_b}: "
+        f"{[str(path) for path in sorted(path_overlap)[:10]]}"
+    )
+
+
+def _print_split_debug(
+    train_paths: list[Path],
+    train_labels: list[int],
+    val_paths: list[Path],
+    val_labels: list[int],
+    test_paths: list[Path],
+    test_labels: list[int],
+) -> None:
+    print("\n[data_loader] Split diagnostics:")
+    print(
+        f"  train unique patients: {len({_patient_id(path) for path in train_paths})}")
+    print(
+        f"  val   unique patients: {len({_patient_id(path) for path in val_paths})}")
+    print(
+        f"  test  unique patients: {len({_patient_id(path) for path in test_paths})}")
+
+    _assert_no_overlap("train", train_paths, "val", val_paths)
+    _assert_no_overlap("train", train_paths, "test", test_paths)
+    _assert_no_overlap("val", val_paths, "test", test_paths)
+
+    _print_class_counts("train", train_labels)
+    _print_class_counts("val", val_labels)
+    _print_class_counts("test", test_labels)
 
 
 # ─── PyTorch Dataset ──────────────────────────────────────────────────────────
@@ -160,7 +252,7 @@ class AlzheimerDataset(Dataset):
     PyTorch Dataset for the OASIS Alzheimer's MRI image dataset.
 
     Each item: (image_tensor, label_int)
-    Image tensor shape: (3, H, W) — float32, normalized to [0, 1] by default.
+    Image tensor shape: (3, H, W).
     """
 
     def __init__(
@@ -182,9 +274,7 @@ class AlzheimerDataset(Dataset):
         img_path = self.image_paths[idx]
         label = self.labels[idx]
 
-        # Open as RGB — some grayscale scans in this dataset need the conversion
         img = Image.open(img_path).convert("RGB")
-
         if self.transform:
             img = self.transform(img)
 
@@ -194,20 +284,13 @@ class AlzheimerDataset(Dataset):
 # ─── Transforms ───────────────────────────────────────────────────────────────
 
 def get_train_transforms(image_size: tuple[int, int] = IMAGE_SIZE) -> transforms.Compose:
-    """
-    Training transforms with light augmentation suitable for MRI scans.
-
-    NOTE: MRI images are medical — aggressive augmentation (colour jitter, heavy
-    flips, random erasing) can distort clinically relevant features.  We keep
-    augmentations conservative.
-    """
+    """Training transforms with light augmentation suitable for MRI scans."""
     return transforms.Compose([
         transforms.Resize(image_size),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomRotation(degrees=10),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1),
-        transforms.ToTensor(),                          # → [0, 1], (C, H, W)
-        transforms.Normalize(                           # ImageNet mean/std (good for EfficientNet)
+        transforms.ToTensor(),
+        transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
             std=[0.229, 0.224, 0.225],
         ),
@@ -235,79 +318,95 @@ def build_dataloaders(
     seed: int = RANDOM_SEED,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """
-    Full pipeline: scan → split → balance → Dataset → DataLoader.
-
-    Args:
-        data_dir:    Root directory containing the class sub-folders.
-        batch_size:  Mini-batch size for all loaders.
-        num_workers: Parallel workers for DataLoader.
-                     On macOS / MPS, set to 0 to avoid forking issues.
-        seed:        Random seed for reproducibility.
-
-    Returns:
-        (train_loader, val_loader, test_loader)
+    Full pipeline: scan → patient split → training-only balance → Dataset → DataLoader.
     """
     print("\n[data_loader] Scanning dataset...")
     all_paths = collect_paths(data_dir)
 
     train_image_paths: list[Path] = []
-    train_labels:      list[int] = []
-    test_image_paths:  list[Path] = []
-    test_labels:       list[int] = []
+    train_labels: list[int] = []
+    val_image_paths: list[Path] = []
+    val_labels: list[int] = []
+    test_image_paths: list[Path] = []
+    test_labels: list[int] = []
 
-    print("\n[data_loader] Splitting by patient (train / test)...")
+    print("\n[data_loader] Splitting by patient (train / val / test)...")
     for class_idx, class_name in enumerate(CLASS_NAMES):
         paths = all_paths[class_name]
+        patient_to_paths = _group_paths_by_patient(paths)
+        patient_ids = sorted(patient_to_paths)
 
-        # Patient-aware train/test split
-        tr_paths, te_paths = _split_by_patient(
-            paths, test_size=TEST_SPLIT, seed=seed)
-
-        # Balance train split
-        tr_paths = _balance_paths(tr_paths, TRAIN_SAMPLES_PER_CLASS, seed=seed)
-
-        # Balance test split (undersample only — don't oversample the test set)
-        te_target = min(TEST_SAMPLES_PER_CLASS, len(te_paths))
-        te_paths = _balance_paths(te_paths, te_target, seed=seed)
-
-        train_image_paths.extend(tr_paths)
-        train_labels.extend([class_idx] * len(tr_paths))
-        test_image_paths.extend(te_paths)
-        test_labels.extend([class_idx] * len(te_paths))
-
-        print(
-            f"  {class_name:<22}: train={len(tr_paths)}, test={len(te_paths)}"
+        train_val_ids, test_ids = _split_sequence(
+            patient_ids,
+            holdout_fraction=TEST_SPLIT,
+            seed=seed + class_idx * 1000,
+            ensure_non_empty_holdout=True,
+        )
+        train_ids, val_ids = _split_sequence(
+            train_val_ids,
+            holdout_fraction=VAL_SPLIT,
+            seed=seed + class_idx * 1000 + 1,
+            ensure_non_empty_holdout=False,
         )
 
-    # Train / val split (stratified by label so class ratio is preserved)
-    tr_paths, val_paths, tr_labels, val_labels = train_test_split(
-        train_image_paths,
-        train_labels,
-        test_size=VAL_SPLIT,
-        stratify=train_labels,
-        random_state=seed,
+        raw_train_paths = _flatten_grouped_paths(patient_to_paths, train_ids)
+        class_val_paths = _flatten_grouped_paths(patient_to_paths, val_ids)
+        class_test_paths = _flatten_grouped_paths(patient_to_paths, test_ids)
+
+        balanced_train_paths = _balance_paths(
+            raw_train_paths,
+            TRAIN_SAMPLES_PER_CLASS,
+            seed=seed + class_idx * 1000 + 2,
+        )
+
+        if not class_val_paths:
+            print(
+                f"  [warning] {class_name}: validation split has 0 patients. "
+                "This class is too small for a leak-free 3-way patient split."
+            )
+
+        train_image_paths.extend(balanced_train_paths)
+        train_labels.extend([class_idx] * len(balanced_train_paths))
+        val_image_paths.extend(class_val_paths)
+        val_labels.extend([class_idx] * len(class_val_paths))
+        test_image_paths.extend(class_test_paths)
+        test_labels.extend([class_idx] * len(class_test_paths))
+
+        print(
+            f"  {class_name:<22}: "
+            f"patients train/val/test={len(train_ids)}/{len(val_ids)}/{len(test_ids)} | "
+            f"images train(raw->balanced)/val/test="
+            f"{len(raw_train_paths)}->{len(balanced_train_paths)}/{len(class_val_paths)}/{len(class_test_paths)}"
+        )
+
+    print("\n[data_loader] Final split sizes:")
+    print(
+        f"  train={len(train_image_paths)}, "
+        f"val={len(val_image_paths)}, "
+        f"test={len(test_image_paths)}"
     )
 
-    print(f"\n[data_loader] Final split sizes:")
-    print(
-        f"  train={len(tr_paths)}, val={len(val_paths)}, test={len(test_image_paths)}")
+    _print_split_debug(
+        train_image_paths,
+        train_labels,
+        val_image_paths,
+        val_labels,
+        test_image_paths,
+        test_labels,
+    )
 
-    # Build Datasets
     train_ds = AlzheimerDataset(
-        tr_paths,             tr_labels,   get_train_transforms())
+        train_image_paths, train_labels, get_train_transforms())
     val_ds = AlzheimerDataset(
-        val_paths,            val_labels,  get_eval_transforms())
+        val_image_paths, val_labels, get_eval_transforms())
     test_ds = AlzheimerDataset(
-        test_image_paths,     test_labels, get_eval_transforms())
+        test_image_paths, test_labels, get_eval_transforms())
 
-    # Build DataLoaders
-    # pin_memory speeds up host→GPU transfer but is not supported for MPS;
-    # we disable it unconditionally here for compatibility.
     common = dict(batch_size=batch_size,
                   num_workers=num_workers, pin_memory=False)
 
-    train_loader = DataLoader(train_ds, shuffle=True,  **common)
-    val_loader = DataLoader(val_ds,   shuffle=False, **common)
-    test_loader = DataLoader(test_ds,  shuffle=False, **common)
+    train_loader = DataLoader(train_ds, shuffle=True, **common)
+    val_loader = DataLoader(val_ds, shuffle=False, **common)
+    test_loader = DataLoader(test_ds, shuffle=False, **common)
 
     return train_loader, val_loader, test_loader
